@@ -1,0 +1,4 @@
+<properties>
+    <property id="isLightMode" type="boolean">false</property>
+    <property id="alwaysBalls" type="boolean">false</property>
+</properties>

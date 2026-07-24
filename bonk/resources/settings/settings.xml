@@ -1,0 +1,8 @@
+<settings>
+    <setting propertyKey="@Properties.isLightMode" title="@Strings.LightModeTitle">
+        <settingConfig type="boolean" />
+    </setting>
+    <setting propertyKey="@Properties.alwaysBalls" title="@Strings.AlwaysBallsTitle">
+        <settingConfig type="boolean" />
+    </setting>
+</settings>

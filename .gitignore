@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Garmin Monkey C build outputs
+bonk/bin/
+bonk/builds/
+bonk/release/
+
+# Release packages (.iq files uploaded to Connect IQ Store)
+# Uncomment the line below to also ignore release artifacts
+# bonk/release/
