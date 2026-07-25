@@ -1,4 +1,4 @@
-# Bonk — Colourful Balls ⌚🎨
+# Bonk: Colourful Balls ⌚🎨
 
 A simple, minimalist Garmin watch face with a colourful twist.
 
