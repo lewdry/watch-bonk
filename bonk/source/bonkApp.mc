@@ -6,14 +6,25 @@ import Toybox.Math;
 import Toybox.Application;
 import Toybox.Application.Properties;
 
-// ── Debug flags — flip for simulator, set both false before a device build ───
+// ── Debug flags ───────────────────────────────────────────────────────────────
 //
-//   DEBUG_ACTIVE     true  → starts in gesture/high-power mode immediately;
-//                            onEnterSleep is a no-op so balls + second dot
-//                            stay visible for the whole sim session.
+//   BOTH must be false before every device / Connect IQ Store build.
+//
+//   DEBUG_ACTIVE     true  → starts in gesture/high-power mode immediately so
+//                            balls + second dot stay visible in the simulator
+//                            without a wrist-raise. Also keeps onEnterSleep
+//                            as a no-op so the face never blanks mid-session.
 //   DEBUG_LIGHT_MODE true  → forces light mode regardless of the stored
 //                            property, without touching Garmin Connect.
-const DEBUG_ACTIVE     as Boolean = true;
+//
+// TIP: wire these up with (:debug) / (:release) annotations in monkey.jungle
+// so the compiler strips the dead branches entirely from release builds:
+//
+//   base.excludeAnnotations    = release
+//   debug.excludeAnnotations   = release
+//   release.excludeAnnotations = debug
+//
+const DEBUG_ACTIVE     as Boolean = false;   // ← MUST be false for device builds
 const DEBUG_LIGHT_MODE as Boolean = false;
 
 const NUM_BALLS       as Number = 18;
@@ -54,41 +65,61 @@ function buildBallColors() as Array<Number> {
 }
 
 // Purely decorative — random size, colour, and position on the screen.
-// No velocity, no physics. Placed once on spawn and never moves.
+// No velocity, no physics. Placed once on spawn/re-spawn and never moves.
+//
+// xi / yi / ri are integer-cached versions of the geometry so that draw()
+// pays zero Float→Number conversion cost per frame (balls never move so
+// the conversion only needs to happen once, inside reinitialize()).
 class Ball {
-    var x      as Float  = 0.0;
-    var y      as Float  = 0.0;
-    var radius as Float  = 0.0;
-    var color  as Number = 0;
+    var xi    as Number = 0;
+    var yi    as Number = 0;
+    var ri    as Number = 0;
+    var color as Number = 0;
 
-    function initialize(w as Number, h as Number, palette as Array<Number>,
-                        isRound as Boolean, cx as Float, cy as Float,
-                        sr as Float) {
-        var minDim = (w < h ? w : h).toFloat();
-        radius = randFloat(0.02, 0.09) * minDim;
+    // Default constructor — fields stay at zero until reinitialize() is called.
+    // Invoked once per slot at app startup; no screen geometry needed here.
+    function initialize() {}
 
+    // Seed or re-seed this ball with fresh random geometry and colour.
+    // Called on every wrist-raise (and once on first layout).
+    // Accepts paletteSize as a pre-computed argument so palette.size() is
+    // not called 18 times inside the spawn loop.
+    function reinitialize(w as Number, h as Number,
+                          palette as Array<Number>, paletteSize as Number,
+                          isRound as Boolean,
+                          cx as Float, cy as Float, sr as Float) as Void {
+        var minDim  = (w < h ? w : h).toFloat();
+        var fRadius = randFloat(0.02, 0.09) * minDim;
+
+        var fx;
+        var fy;
         if (isRound) {
-            var maxDist = sr - radius;
+            var maxDist = sr - fRadius;
             if (maxDist < 0.0) { maxDist = 0.0; }
 
             // Raising a uniform [0,1] to a power < 0.5 biases placement toward
             // the edge (0.5 = area-uniform, lower = more edge-biased).
             var spawnDist  = maxDist * Math.pow(randFloat(0.0, 1.0), 0.35);
             var spawnAngle = randFloat(0.0, TAU);
-            x = cx + spawnDist * Math.cos(spawnAngle);
-            y = cy + spawnDist * Math.sin(spawnAngle);
+            fx = cx + spawnDist * Math.cos(spawnAngle);
+            fy = cy + spawnDist * Math.sin(spawnAngle);
         } else {
-            var margin = radius + BOUNDARY_MARGIN;
-            x = randFloat(margin, w - margin);
-            y = randFloat(margin, h - margin);
+            var margin = fRadius + BOUNDARY_MARGIN;
+            fx = randFloat(margin, (w - margin).toFloat());
+            fy = randFloat(margin, (h - margin).toFloat());
         }
 
-        color = palette[Math.rand() % palette.size()];
+        // Convert to integers once here; draw() uses them directly with no
+        // per-frame conversion cost.
+        xi    = fx.toNumber();
+        yi    = fy.toNumber();
+        ri    = fRadius.toNumber();
+        color = palette[Math.rand() % paletteSize];
     }
 
     function draw(dc as Graphics.Dc) as Void {
         dc.setColor(color, Graphics.COLOR_TRANSPARENT);
-        dc.fillCircle(x.toNumber(), y.toNumber(), radius.toNumber());
+        dc.fillCircle(xi, yi, ri);
     }
 }
 
@@ -100,8 +131,11 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
     private var _isRound      as Boolean = false;
     private var _centerX      as Float   = 0.0;
     private var _centerY      as Float   = 0.0;
+    private var _centerXi     as Number  = 0;   // integer cache — used in drawText every frame
+    private var _centerYi     as Number  = 0;   // integer cache — used in drawText every frame
     private var _screenRadius as Float   = 0.0;
     private var _dotRadius    as Float   = 0.0;
+    private var _dotRadiusi   as Number  = 0;   // integer cache — used in fillCircle every second
     private var _orbitRadius  as Float   = 0.0; // pre-computed: screenRadius - dotRadius - margin
 
     // ── Cached settings & derived draw colours ─────────────────────────────
@@ -114,7 +148,11 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
     private var _dotColor    as Number  = Graphics.COLOR_WHITE;
 
     // ── Ball state ─────────────────────────────────────────────────────────
+    // _balls is pre-allocated once in initialize() and reused forever —
+    // no heap allocation or GC pressure on every wrist-raise.
+    // _ballCount controls rendering: 0 = hidden, NUM_BALLS = fully visible.
     private var _balls      as Array<Ball>   = [] as Array<Ball>;
+    private var _ballCount  as Number        = 0;
     private var _ballColors as Array<Number> = [] as Array<Number>;
 
     // ── Sleep / gesture state ──────────────────────────────────────────────
@@ -132,6 +170,14 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
         WatchFace.initialize();
         Math.srand(System.getTimer());
         _ballColors = buildBallColors(); // built once, reused forever
+
+        // Pre-allocate Ball objects so spawnBalls() can reinitialize them
+        // in-place rather than allocating a fresh array on every wrist-raise.
+        // Screen geometry isn't available yet; reinitialize() is called later
+        // from spawnBalls() after onLayout has run.
+        for (var i = 0; i < NUM_BALLS; i++) {
+            _balls.add(new Ball());
+        }
     }
 
     function onLayout(dc as Graphics.Dc) as Void {
@@ -142,8 +188,11 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
         _isRound      = (dev.screenShape == System.SCREEN_SHAPE_ROUND);
         _centerX      = _width  / 2.0;
         _centerY      = _height / 2.0;
+        _centerXi     = _centerX.toNumber(); // cached — avoids division every frame
+        _centerYi     = _centerY.toNumber(); // cached — avoids division every frame
         _screenRadius = (_width < _height ? _width : _height) / 2.0;
         _dotRadius    = _screenRadius * 0.05;
+        _dotRadiusi   = _dotRadius.toNumber(); // cached — avoids conversion every second
         _orbitRadius  = _screenRadius - _dotRadius - BOUNDARY_MARGIN;
 
         // First settings load — must happen after geometry is ready in case
@@ -186,8 +235,9 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
                 // Setting just turned ON while sleeping — spawn balls immediately.
                 spawnBalls();
             } else if (!_alwaysBalls && wasAlwaysBalls) {
-                // Setting just turned OFF while sleeping — clear balls immediately.
-                _balls = [] as Array<Ball>;
+                // Setting just turned OFF while sleeping — hide balls immediately.
+                // The array stays allocated; _ballCount = 0 makes the draw loop free.
+                _ballCount = 0;
             }
         }
         // No change needed while gesture is active: balls are always showing
@@ -195,11 +245,14 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
     }
 
     private function spawnBalls() as Void {
-        _balls = [] as Array<Ball>;
+        // Reuse the pre-allocated Ball objects — no heap allocation, no GC.
+        // Palette size is cached once here rather than inside each reinitialize().
+        var paletteSize = _ballColors.size();
         for (var i = 0; i < NUM_BALLS; i++) {
-            _balls.add(new Ball(_width, _height, _ballColors,
-                                _isRound, _centerX, _centerY, _screenRadius));
+            _balls[i].reinitialize(_width, _height, _ballColors, paletteSize,
+                                   _isRound, _centerX, _centerY, _screenRadius);
         }
+        _ballCount = NUM_BALLS;
     }
 
     // ── Draw ───────────────────────────────────────────────────────────────
@@ -209,27 +262,30 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
     // In low-power mode it is called only when WatchUi.requestUpdate() fires
     // (e.g. once a minute for the time, or immediately after state changes).
     function onUpdate(dc as Graphics.Dc) as Void {
+        // Single OS call shared by drawTime() and drawSecondDot() — avoids
+        // crossing the VM→OS boundary twice per frame at 1Hz (3 600 extra
+        // calls/hour saved when the gesture/second-dot is active).
+        var ct = System.getClockTime();
+
         dc.setColor(_bgColor, _bgColor);
         dc.clear();
 
-        // _balls is empty when we are sleeping AND alwaysBalls is off,
+        // _ballCount is 0 when sleeping AND alwaysBalls is off,
         // so this loop costs nothing in the common low-power case.
-        var n = _balls.size();
-        for (var i = 0; i < n; i++) {
+        for (var i = 0; i < _ballCount; i++) {
             _balls[i].draw(dc);
         }
 
-        drawTime(dc);
+        drawTime(dc, ct);
 
         // Second dot is power-hungry (forces 1Hz high-power redraws).
         // Show it only while the gesture / wake is active.
         if (_isGestureActive) {
-            drawSecondDot(dc);
+            drawSecondDot(dc, ct);
         }
     }
 
-    private function drawTime(dc as Graphics.Dc) as Void {
-        var ct = System.getClockTime(); // .hour is always 0-23
+    private function drawTime(dc as Graphics.Dc, ct as ClockTime) as Void {
         if (ct.min != _lastMinute) {
             _lastMinute = ct.min;
             _cachedTimeString = Lang.format("$1$:$2$", [
@@ -238,18 +294,22 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
             ]);
         }
         dc.setColor(_timeColor, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(_width / 2, _height / 2,
+        // _centerXi / _centerYi are integer-cached in onLayout — no per-frame
+        // integer division here.
+        dc.drawText(_centerXi, _centerYi,
                     Graphics.FONT_NUMBER_HOT, _cachedTimeString,
                     Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER);
     }
 
     // Classic clock-hand placement: 0 s points straight up, clockwise.
-    private function drawSecondDot(dc as Graphics.Dc) as Void {
-        var theta = (System.getClockTime().sec / 60.0) * TAU;
+    // Uses the ClockTime already fetched by onUpdate() — no second OS call.
+    private function drawSecondDot(dc as Graphics.Dc, ct as ClockTime) as Void {
+        var theta = (ct.sec / 60.0) * TAU;
         var dotX  = _centerX + _orbitRadius * Math.sin(theta);
         var dotY  = _centerY - _orbitRadius * Math.cos(theta);
         dc.setColor(_dotColor, Graphics.COLOR_TRANSPARENT);
-        dc.fillCircle(dotX.toNumber(), dotY.toNumber(), _dotRadius.toNumber());
+        // _dotRadiusi is integer-cached in onLayout — no per-frame conversion.
+        dc.fillCircle(dotX.toNumber(), dotY.toNumber(), _dotRadiusi);
     }
 
     // ── Sleep / wake callbacks ─────────────────────────────────────────────
@@ -265,16 +325,16 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
 
     // Low-power mode: wrist lowered.
     // Second dot disappears in both modes.
-    // Balls: cleared in default mode, kept (at freshly-spawned positions) in
-    // always-balls mode — low-power redraw is minute-driven so keeping the
-    // array costs only memory, not CPU.
+    // Balls: hidden (_ballCount = 0) in default mode, kept visible in
+    // alwaysBalls mode — low-power redraw is minute-driven so keeping the
+    // array alive costs only memory, not CPU.
     function onEnterSleep() as Void {
         // Debug: keep gesture state alive so the simulator doesn't blank the
         // face every time onEnterSleep fires.
         if (DEBUG_ACTIVE) { return; }
         _isGestureActive = false;
         if (!_alwaysBalls) {
-            _balls = [] as Array<Ball>;
+            _ballCount = 0;
         }
         WatchUi.requestUpdate();
     }
