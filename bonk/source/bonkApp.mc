@@ -11,18 +11,11 @@ import Toybox.Application.Properties;
 //   BOTH must be false before every device / Connect IQ Store build.
 //
 //   DEBUG_ACTIVE     true  → starts in gesture/high-power mode immediately so
-//                            balls + second dot stay visible in the simulator
-//                            without a wrist-raise. Also keeps onEnterSleep
-//                            as a no-op so the face never blanks mid-session.
+//                            balls stay visible in the simulator without a
+//                            wrist-raise. Also keeps onEnterSleep as a no-op
+//                            so the face never blanks mid-session.
 //   DEBUG_LIGHT_MODE true  → forces light mode regardless of the stored
 //                            property, without touching Garmin Connect.
-//
-// TIP: wire these up with (:debug) / (:release) annotations in monkey.jungle
-// so the compiler strips the dead branches entirely from release builds:
-//
-//   base.excludeAnnotations    = release
-//   debug.excludeAnnotations   = release
-//   release.excludeAnnotations = debug
 //
 const DEBUG_ACTIVE     as Boolean = false;   // ← MUST be false for device builds
 const DEBUG_LIGHT_MODE as Boolean = false;
@@ -30,6 +23,11 @@ const DEBUG_LIGHT_MODE as Boolean = false;
 const NUM_BALLS       as Number = 18;
 const BOUNDARY_MARGIN as Float  = 1.0;
 const TAU             as Float  = 6.28318; // 2π — avoids repeating the literal
+
+// Ball size range, as a fraction of the screen's shorter dimension.
+// Bumped up one increment (+0.01 each bound) from the original 0.02/0.09.
+const BALL_MIN_SIZE_FRACTION as Float = 0.03;
+const BALL_MAX_SIZE_FRACTION as Float = 0.10;
 
 function randFloat(minVal as Float, maxVal as Float) as Float {
     // Integer modulo then a single multiply is cheaper than two fp divisions.
@@ -89,7 +87,7 @@ class Ball {
                           isRound as Boolean,
                           cx as Float, cy as Float, sr as Float) as Void {
         var minDim  = (w < h ? w : h).toFloat();
-        var fRadius = randFloat(0.02, 0.09) * minDim;
+        var fRadius = randFloat(BALL_MIN_SIZE_FRACTION, BALL_MAX_SIZE_FRACTION) * minDim;
 
         var fx;
         var fy;
@@ -134,9 +132,6 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
     private var _centerXi     as Number  = 0;   // integer cache — used in drawText every frame
     private var _centerYi     as Number  = 0;   // integer cache — used in drawText every frame
     private var _screenRadius as Float   = 0.0;
-    private var _dotRadius    as Float   = 0.0;
-    private var _dotRadiusi   as Number  = 0;   // integer cache — used in fillCircle every second
-    private var _orbitRadius  as Float   = 0.0; // pre-computed: screenRadius - dotRadius - margin
 
     // ── Cached settings & derived draw colours ─────────────────────────────
     // Refreshed only via refreshSettings(), never read from Properties on
@@ -145,7 +140,6 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
     private var _alwaysBalls as Boolean = false;
     private var _bgColor     as Number  = Graphics.COLOR_BLACK;
     private var _timeColor   as Number  = Graphics.COLOR_WHITE;
-    private var _dotColor    as Number  = Graphics.COLOR_WHITE;
 
     // ── Ball state ─────────────────────────────────────────────────────────
     // _balls is pre-allocated once in initialize() and reused forever —
@@ -157,12 +151,12 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
 
     // ── Sleep / gesture state ──────────────────────────────────────────────
     // True only in high-power mode (post-gesture / onExitSleep).
-    // Controls second-dot visibility and whether onUpdate drives 1Hz redraws.
+    // Controls whether the low-power ball-hide logic applies.
     private var _isGestureActive as Boolean = false;
 
     // ── Time-string cache ──────────────────────────────────────────────────
     // Rebuilt only when the minute ticks over; avoids string allocation every
-    // second while the second dot is ticking.
+    // redraw.
     private var _lastMinute       as Number = -1;
     private var _cachedTimeString as String = "";
 
@@ -191,9 +185,6 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
         _centerXi     = _centerX.toNumber(); // cached — avoids division every frame
         _centerYi     = _centerY.toNumber(); // cached — avoids division every frame
         _screenRadius = (_width < _height ? _width : _height) / 2.0;
-        _dotRadius    = _screenRadius * 0.05;
-        _dotRadiusi   = _dotRadius.toNumber(); // cached — avoids conversion every second
-        _orbitRadius  = _screenRadius - _dotRadius - BOUNDARY_MARGIN;
 
         // First settings load — must happen after geometry is ready in case
         // alwaysBalls is on and we need to spawn immediately.
@@ -223,8 +214,6 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
             _isLightMode = newLight;
             _bgColor     = _isLightMode ? Graphics.COLOR_WHITE : Graphics.COLOR_BLACK;
             _timeColor   = _isLightMode ? Graphics.COLOR_BLACK : Graphics.COLOR_WHITE;
-            // Second dot must always contrast with background to remain visible.
-            _dotColor    = _isLightMode ? Graphics.COLOR_BLACK : Graphics.COLOR_WHITE;
         }
 
         var wasAlwaysBalls = _alwaysBalls;
@@ -258,13 +247,11 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
     // ── Draw ───────────────────────────────────────────────────────────────
 
     // MIP displays are capped by the OS to 1 full-screen redraw/second in
-    // high-power mode; onUpdate() is called automatically at that cadence.
-    // In low-power mode it is called only when WatchUi.requestUpdate() fires
-    // (e.g. once a minute for the time, or immediately after state changes).
+    // high-power mode; onUpdate() is called automatically at that cadence
+    // regardless of what the app draws. In low-power mode it is called only
+    // when WatchUi.requestUpdate() fires (e.g. once a minute for the time,
+    // or immediately after a state change).
     function onUpdate(dc as Graphics.Dc) as Void {
-        // Single OS call shared by drawTime() and drawSecondDot() — avoids
-        // crossing the VM→OS boundary twice per frame at 1Hz (3 600 extra
-        // calls/hour saved when the gesture/second-dot is active).
         var ct = System.getClockTime();
 
         dc.setColor(_bgColor, _bgColor);
@@ -277,12 +264,6 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
         }
 
         drawTime(dc, ct);
-
-        // Second dot is power-hungry (forces 1Hz high-power redraws).
-        // Show it only while the gesture / wake is active.
-        if (_isGestureActive) {
-            drawSecondDot(dc, ct);
-        }
     }
 
     private function drawTime(dc as Graphics.Dc, ct as ClockTime) as Void {
@@ -301,17 +282,6 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
                     Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER);
     }
 
-    // Classic clock-hand placement: 0 s points straight up, clockwise.
-    // Uses the ClockTime already fetched by onUpdate() — no second OS call.
-    private function drawSecondDot(dc as Graphics.Dc, ct as ClockTime) as Void {
-        var theta = (ct.sec / 60.0) * TAU;
-        var dotX  = _centerX + _orbitRadius * Math.sin(theta);
-        var dotY  = _centerY - _orbitRadius * Math.cos(theta);
-        dc.setColor(_dotColor, Graphics.COLOR_TRANSPARENT);
-        // _dotRadiusi is integer-cached in onLayout — no per-frame conversion.
-        dc.fillCircle(dotX.toNumber(), dotY.toNumber(), _dotRadiusi);
-    }
-
     // ── Sleep / wake callbacks ─────────────────────────────────────────────
 
     // High-power mode: gesture detected.
@@ -324,7 +294,6 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
     }
 
     // Low-power mode: wrist lowered.
-    // Second dot disappears in both modes.
     // Balls: hidden (_ballCount = 0) in default mode, kept visible in
     // alwaysBalls mode — low-power redraw is minute-driven so keeping the
     // array alive costs only memory, not CPU.
