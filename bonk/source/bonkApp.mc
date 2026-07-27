@@ -267,19 +267,26 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
     }
 
     private function drawTime(dc as Graphics.Dc, ct as ClockTime) as Void {
-        if (ct.min != _lastMinute) {
-            _lastMinute = ct.min;
-            _cachedTimeString = Lang.format("$1$:$2$", [
-                ct.hour.format("%02d"),
-                ct.min.format("%02d")
-            ]);
+    if (ct.min != _lastMinute) {
+        _lastMinute = ct.min;
+
+        var hour = ct.hour;
+        var is24Hour = System.getDeviceSettings().is24Hour;
+
+        if (!is24Hour) {
+            hour = hour % 12;
+            if (hour == 0) { hour = 12; }
         }
-        dc.setColor(_timeColor, Graphics.COLOR_TRANSPARENT);
-        // _centerXi / _centerYi are integer-cached in onLayout — no per-frame
-        // integer division here.
-        dc.drawText(_centerXi, _centerYi,
-                    Graphics.FONT_NUMBER_HOT, _cachedTimeString,
-                    Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER);
+
+        _cachedTimeString = Lang.format("$1$:$2$", [
+            is24Hour ? hour.format("%02d") : hour.format("%d"),
+            ct.min.format("%02d")
+        ]);
+    }
+    dc.setColor(_timeColor, Graphics.COLOR_TRANSPARENT);
+    dc.drawText(_centerXi, _centerYi,
+                Graphics.FONT_NUMBER_HOT, _cachedTimeString,
+                Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER);
     }
 
     // ── Sleep / wake callbacks ─────────────────────────────────────────────
