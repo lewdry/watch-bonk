@@ -6,20 +6,6 @@ import Toybox.Math;
 import Toybox.Application;
 import Toybox.Application.Properties;
 
-// ── Debug flags ───────────────────────────────────────────────────────────────
-//
-//   BOTH must be false before every device / Connect IQ Store build.
-//
-//   DEBUG_ACTIVE     true  → starts in gesture/high-power mode immediately so
-//                            balls stay visible in the simulator without a
-//                            wrist-raise. Also keeps onEnterSleep as a no-op
-//                            so the face never blanks mid-session.
-//   DEBUG_LIGHT_MODE true  → forces light mode regardless of the stored
-//                            property, without touching Garmin Connect.
-//
-const DEBUG_ACTIVE     as Boolean = false;   // ← MUST be false for device builds
-const DEBUG_LIGHT_MODE as Boolean = false;
-
 const NUM_BALLS       as Number = 18;
 const BOUNDARY_MARGIN as Float  = 1.0;
 const TAU             as Float  = 6.28318; // 2π — avoids repeating the literal
@@ -145,9 +131,10 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
     // _balls is pre-allocated once in initialize() and reused forever —
     // no heap allocation or GC pressure on every wrist-raise.
     // _ballCount controls rendering: 0 = hidden, NUM_BALLS = fully visible.
-    private var _balls      as Array<Ball>   = [] as Array<Ball>;
-    private var _ballCount  as Number        = 0;
-    private var _ballColors as Array<Number> = [] as Array<Number>;
+    private var _balls           as Array<Ball>   = [] as Array<Ball>;
+    private var _ballCount       as Number        = 0;
+    private var _ballColors      as Array<Number> = [] as Array<Number>;
+    private var _lastSpawnMinute as Number        = -1;
 
     // ── Sleep / gesture state ──────────────────────────────────────────────
     // True only in high-power mode (post-gesture / onExitSleep).
@@ -189,25 +176,17 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
         // First settings load — must happen after geometry is ready in case
         // alwaysBalls is on and we need to spawn immediately.
         refreshSettings();
-
-        // Debug: start in gesture/active mode so the simulator shows the full
-        // face without needing a wrist-raise.
-        if (DEBUG_ACTIVE) {
-            _isGestureActive = true;
-            spawnBalls();
-        }
     }
 
     // Read and cache all user properties, then recompute any derived state.
     // Called once at startup (via onLayout) and again from bonkApp whenever
     // the user changes a setting — never called from onUpdate.
     function refreshSettings() as Void {
-        // DEBUG_LIGHT_MODE overrides the stored property so you can test the
-        // light theme in the simulator without touching Garmin Connect.
-        var newLight = DEBUG_LIGHT_MODE
-            ? true
-            : Properties.getValue("isLightMode") as Boolean;
-        var newAlwaysBalls = Properties.getValue("alwaysBalls") as Boolean;
+        var rawLight = Properties.getValue("isLightMode");
+        var newLight = (rawLight != null) ? (rawLight as Boolean) : false;
+
+        var rawAlwaysBalls = Properties.getValue("alwaysBalls");
+        var newAlwaysBalls = (rawAlwaysBalls != null) ? (rawAlwaysBalls as Boolean) : false;
 
         // Only recompute colours if the light/dark setting actually changed.
         if (newLight != _isLightMode) {
@@ -234,6 +213,8 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
     }
 
     private function spawnBalls() as Void {
+        _lastSpawnMinute = System.getClockTime().min;
+
         // Reuse the pre-allocated Ball objects — no heap allocation, no GC.
         // Palette size is cached once here rather than inside each reinitialize().
         var paletteSize = _ballColors.size();
@@ -254,6 +235,27 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
     function onUpdate(dc as Graphics.Dc) as Void {
         var ct = System.getClockTime();
 
+        if (ct.min != _lastMinute) {
+            _lastMinute = ct.min;
+
+            var hour = ct.hour;
+            var is24Hour = System.getDeviceSettings().is24Hour;
+
+            if (!is24Hour) {
+                hour = hour % 12;
+                if (hour == 0) { hour = 12; }
+            }
+
+            _cachedTimeString = Lang.format("$1$:$2$", [
+                is24Hour ? hour.format("%02d") : hour.format("%d"),
+                ct.min.format("%02d")
+            ]);
+
+            if (_alwaysBalls && _lastSpawnMinute != ct.min) {
+                spawnBalls();
+            }
+        }
+
         dc.setColor(_bgColor, _bgColor);
         dc.clear();
 
@@ -263,30 +265,14 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
             _balls[i].draw(dc);
         }
 
-        drawTime(dc, ct);
+        drawTime(dc);
     }
 
-    private function drawTime(dc as Graphics.Dc, ct as ClockTime) as Void {
-    if (ct.min != _lastMinute) {
-        _lastMinute = ct.min;
-
-        var hour = ct.hour;
-        var is24Hour = System.getDeviceSettings().is24Hour;
-
-        if (!is24Hour) {
-            hour = hour % 12;
-            if (hour == 0) { hour = 12; }
-        }
-
-        _cachedTimeString = Lang.format("$1$:$2$", [
-            is24Hour ? hour.format("%02d") : hour.format("%d"),
-            ct.min.format("%02d")
-        ]);
-    }
-    dc.setColor(_timeColor, Graphics.COLOR_TRANSPARENT);
-    dc.drawText(_centerXi, _centerYi,
-                Graphics.FONT_NUMBER_HOT, _cachedTimeString,
-                Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER);
+    private function drawTime(dc as Graphics.Dc) as Void {
+        dc.setColor(_timeColor, Graphics.COLOR_TRANSPARENT);
+        dc.drawText(_centerXi, _centerYi,
+                    Graphics.FONT_NUMBER_HOT, _cachedTimeString,
+                    Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER);
     }
 
     // ── Sleep / wake callbacks ─────────────────────────────────────────────
@@ -305,9 +291,6 @@ class BounceWatchFaceView extends WatchUi.WatchFace {
     // alwaysBalls mode — low-power redraw is minute-driven so keeping the
     // array alive costs only memory, not CPU.
     function onEnterSleep() as Void {
-        // Debug: keep gesture state alive so the simulator doesn't blank the
-        // face every time onEnterSleep fires.
-        if (DEBUG_ACTIVE) { return; }
         _isGestureActive = false;
         if (!_alwaysBalls) {
             _ballCount = 0;
@@ -345,3 +328,4 @@ class bonkApp extends Application.AppBase {
 function getApp() as bonkApp {
     return Application.getApp() as bonkApp;
 }
+
